@@ -1,0 +1,2573 @@
+{
+  "name": "AI Receptionist Backend (Vapi + Google Sheets/Calendar) - Multi-Tenant V3",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "vapi-receptionist",
+        "authentication": "headerAuth",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "541aac3e-f5e6-4ab3-b700-199b974798f6",
+      "name": "Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        -13712,
+        -3088
+      ],
+      "webhookId": "4be3ee08-d64d-402c-830c-ddb31e0977af",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "2oSBz1IqFY4yVXnR",
+          "name": "Header Auth account"
+        }
+      },
+      "notes": "Header name/value configured in the credential itself: X-API-Key / <secret>"
+    },
+    {
+      "parameters": {
+        "jsCode": "const item = $input.first().json;\nconst meta = { started_at: Date.now(), request_id: String($execution.id) };\nlet action = '_unknown';\n\nconst SPEC = {\n  get_faq:                    { req: ['query'],                                                      opt: [] },\n  check_availability:         { req: ['service', 'date', 'time'],                                    opt: [] },\n  book_appointment:           { req: ['service', 'date', 'time', 'customer_name', 'customer_phone'], opt: ['customer_email'] },\n  cancel_appointment:         { req: ['customer_phone', 'appointment_date'],                         opt: ['service', 'appointment_time'] },\n  get_current_datetime:       { req: [],                                                             opt: [] },\n  check_package_availability: { req: ['service', 'start_date', 'session_time'],                      opt: ['days_of_week'] },\n  book_package_appointment:   { req: ['service', 'start_date', 'session_time', 'customer_name', 'customer_phone'], opt: ['customer_email', 'days_of_week'] },\n};\nclass V extends Error { constructor(http, category, msg) { super(msg); this.http = http; this.category = category; } }\n\nconst isDate = s => {\n  const m = /^(\\d{4})-(\\d{2})-(\\d{2})$/.exec(s); if (!m) return false;\n  const [y, mo, d] = [+m[1], +m[2], +m[3]], dt = new Date(Date.UTC(y, mo - 1, d));\n  return dt.getUTCFullYear() === y && dt.getUTCMonth() === mo - 1 && dt.getUTCDate() === d;\n};\nconst normTime = s => {\n  const m = /^(\\d{1,2}):(\\d{2})$/.exec(s);\n  if (!m || +m[1] > 23 || +m[2] > 59) return null;\n  return String(+m[1]).padStart(2, '0') + ':' + m[2];\n};\n\ntry {\n  const ct = String(item.headers?.['content-type'] ?? '').toLowerCase();\n  if (!ct.startsWith('application/json')) throw new V(415, 'unsupported_media_type', 'Unsupported content type.');\n  const b = item.body;\n  if (!b || typeof b !== 'object' || Array.isArray(b)) throw new V(400, 'bad_request', 'The request body must be a JSON object.');\n\n  const a = typeof b.action === 'string' ? b.action.trim() : '';\n  if (!Object.prototype.hasOwnProperty.call(SPEC, a)) throw new V(400, 'invalid_action', 'Unsupported action.');\n  action = a;\n  const spec = SPEC[a];\n  const allowed = new Set(['action', 'business_id', ...spec.req, ...spec.opt]);\n  for (const k of Object.keys(b)) if (!allowed.has(k)) throw new V(400, 'unexpected_field', 'The request contained an unexpected field.');\n\n  const take = (k, required, max) => {\n    let v = b[k];\n    if (v === undefined || v === null || v === '') { if (required) throw new V(400, 'missing_field', `${k} is required.`); return undefined; }\n    if (typeof v !== 'string') throw new V(400, 'bad_type', `${k} must be a string.`);\n    v = v.normalize('NFKC').replace(/\\s+/g, ' ').trim();\n    if (v === '') { if (required) throw new V(400, 'missing_field', `${k} is required.`); return undefined; }\n    if (v.length > max) throw new V(400, 'too_long', `${k} is too long.`);\n    if (/[\\u0000-\\u001F\\u007F]/.test(v)) throw new V(400, 'bad_chars', `${k} contains invalid characters.`);\n    return v;\n  };\n\n  const business_id = take('business_id', true, 64);\n  if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/.test(business_id)) throw new V(400, 'bad_business_id', 'business_id is not valid.');\n  const req = { action, business_id };\n\n  const MAX = { query: 500, customer_email: 254, customer_name: 80, service: 100, customer_phone: 25, date: 10, appointment_date: 10, time: 5, appointment_time: 5, start_date: 10, session_time: 5, days_of_week: 27 };\n  for (const k of [...spec.req, ...spec.opt]) {\n    let v = take(k, spec.req.includes(k), MAX[k]);\n    if (v === undefined) continue;\n    if (k === 'date' || k === 'appointment_date') {\n      if (!isDate(v)) throw new V(400, 'bad_date', `${k} must be a real date in YYYY-MM-DD format.`);\n    } else if (k === 'time' || k === 'appointment_time') {\n      v = normTime(v); if (!v) throw new V(400, 'bad_time', `${k} must be a 24-hour time in HH:mm format.`);\n    } else if (k === 'customer_phone') {\n      const digits = v.replace(/\\D/g, '');\n      if (!/^[+\\d\\s().-]+$/.test(v) || digits.length < 7 || digits.length > 16) throw new V(400, 'bad_phone', 'customer_phone is not a valid phone number.');\n    } else if (k === 'customer_email') {\n      v = v.toLowerCase();\n      if (!/^[^\\s@]{1,64}@[^\\s@]+\\.[^\\s@]{2,}$/.test(v)) throw new V(400, 'bad_email', 'customer_email is not a valid email address.');\n    } else if (k === 'customer_name') {\n      if (!/^[\\p{L}\\p{M}][\\p{L}\\p{M} .'\\u2019-]{1,79}$/u.test(v)) throw new V(400, 'bad_name', 'customer_name is not valid.');\n    } else if (k === 'service') {\n      if (!/^[\\p{L}\\p{N} &'\\u2019()\\/.,+-]{1,100}$/u.test(v)) throw new V(400, 'bad_service', 'service is not valid.');\n    } else if (k === 'start_date') {\n      if (!isDate(v)) throw new V(400, 'bad_date', 'start_date must be a real date in YYYY-MM-DD format.');\n    } else if (k === 'session_time') {\n      v = normTime(v); if (!v) throw new V(400, 'bad_time', 'session_time must be a 24-hour time in HH:mm format.');\n    } else if (k === 'days_of_week') {\n      v = v.toLowerCase().replace(/\\s+/g, '');\n      const parts = v.split(',');\n      const valid = ['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun'];\n      if (parts.length === 0 || parts.length > 7 || !parts.every(p => valid.includes(p)) || new Set(parts).size !== parts.length) {\n        throw new V(400, 'bad_days_of_week', 'days_of_week must be a comma-separated list of mon,tue,wed,thu,fri,sat,sun with no repeats.');\n      }\n    }\n    req[k] = v;\n  }\n  return [{ json: { meta, req } }];\n} catch (e) {\n  const v = e instanceof V ? e : new V(500, 'internal_error', 'Something went wrong.');\n  return [{ json: { meta, res: { action, http: v.http, category: v.category, msg: v.message } } }];\n}"
+      },
+      "id": "f42c4b3e-9d94-47e2-8c0f-6f886f5721ec",
+      "name": "Validate Request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -13488,
+        -3088
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 1
+          },
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{ !!$json.req }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "6b2d8f38-1ee0-4feb-88bd-e0000dab66ce",
+      "name": "Request OK?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        -13264,
+        -3088
+      ]
+    },
+    {
+      "parameters": {
+        "documentId": {
+          "__rl": true,
+          "value": "1oMgY6GonFFaWiiWqZy5xyRxDBNrNnABF5bsgLI3Emug",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": 1496072492,
+          "mode": "list",
+          "cachedResultName": "registry-businesses-template.csv",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1oMgY6GonFFaWiiWqZy5xyRxDBNrNnABF5bsgLI3Emug/edit#gid=1496072492"
+        },
+        "filtersUI": {
+          "values": [
+            {
+              "lookupColumn": "business_id",
+              "lookupValue": "={{ $json.req.business_id }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "3cc6300c-573a-4b92-b7ff-07ffaf54393e",
+      "name": "Load Business",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        -13040,
+        -3200
+      ],
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "ESJngjNaYUxqZvmR",
+          "name": "Google Sheets account"
+        }
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "const { req, meta } = $('Validate Request').first().json;\n\nconst fail = (http, category, msg) => [{ json: { meta, req, res: { action: req.action, http, category, msg } } }];\nconst UNAVAILABLE = \"I'm unable to help with that right now.\";\n\nconst normalizeRow = (obj) => {\n  const out = {};\n  for (const [k, v] of Object.entries(obj ?? {})) {\n    const nk = String(k).trim().toLowerCase().replace(/[\\s\\-]+/g, '_').replace(/[^a-z0-9_]/g, '');\n    if (nk && !(nk in out)) out[nk] = v;\n  }\n  return out;\n};\n\nconst rows = $input.all()\n  .map(i => normalizeRow(i.json))\n  .filter(r => String(r?.business_id ?? '').trim() === req.business_id);\n\nif (rows.length === 0) return fail(404, 'unknown_business', UNAVAILABLE);\nif (rows.length > 1) return fail(404, 'duplicate_business_row', UNAVAILABLE);\n\nconst row = rows[0];\nconst s = k => String(row[k] ?? '').trim();\n\nfor (const k of ['business_name','timezone','google_services_sheet_id','google_faqs_sheet_id','google_calendar_id','business_hours','booking_enabled','default_country_calling_code']) {\n  if (!s(k)) return fail(404, 'incomplete_config', UNAVAILABLE);\n}\n\nconst tz = s('timezone');\nif (!DateTime.now().setZone(tz).isValid) return fail(404, 'bad_timezone', UNAVAILABLE);\nif (!/^[A-Za-z0-9_-]{20,120}$/.test(s('google_services_sheet_id'))) return fail(404, 'bad_services_sheet_id', UNAVAILABLE);\nif (!/^[A-Za-z0-9_-]{20,120}$/.test(s('google_faqs_sheet_id'))) return fail(404, 'bad_faqs_sheet_id', UNAVAILABLE);\nif (!/^[A-Za-z0-9._%+@-]{3,200}$/.test(s('google_calendar_id'))) return fail(404, 'bad_calendar_id', UNAVAILABLE);\n\nconst cc = s('default_country_calling_code');\nif (!/^\\d{1,3}$/.test(cc)) return fail(404, 'bad_calling_code', UNAVAILABLE);\n\nconst DAYS = ['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun'];\n\nfunction parseHours(str) {\n  const out = {};\n  DAYS.forEach(d => out[d] = []);\n  const seen = new Set();\n  for (const part of str.toLowerCase().split(';').map(x => x.trim()).filter(Boolean)) {\n    const [d, rest] = part.split('=').map(x => x.trim());\n    if (!DAYS.includes(d) || seen.has(d) || rest === undefined) return null;\n    seen.add(d);\n    if (rest === 'closed') continue;\n    for (const r of rest.split(',')) {\n      const m = /^(\\d{2}):(\\d{2})-(\\d{2}):(\\d{2})$/.exec(r.trim());\n      if (!m) return null;\n      const a = +m[1] * 60 + +m[2], z = +m[3] * 60 + +m[4];\n      if (+m[1] > 23 || +m[3] > 23 || +m[2] > 59 || +m[4] > 59 || a >= z) return null;\n      out[d].push([a, z]);\n    }\n    out[d].sort((x, y) => x[0] - y[0]);\n    for (let i = 1; i < out[d].length; i++) if (out[d][i][0] < out[d][i - 1][1]) return null;\n  }\n  return seen.size === 7 ? out : null;\n}\n\nconst hours = parseHours(s('business_hours'));\nif (!hours) return fail(404, 'bad_hours', UNAVAILABLE);\n\nconst num = (k, def, min, max) => {\n  if (s(k) === '') return def;\n  const n = Number(s(k));\n  return Number.isInteger(n) && n >= min && n <= max ? n : NaN;\n};\n\nconst slot_interval = num('slot_interval_minutes', 30, 5, 240);\nconst min_notice = num('min_notice_minutes', 0, 0, 10080);\nconst max_advance_days = num('max_advance_days', 90, 1, 730);\nif ([slot_interval, min_notice, max_advance_days].some(Number.isNaN)) return fail(404, 'bad_numeric_config', UNAVAILABLE);\n\nconst booking_enabled = ['true', 'yes', '1'].includes(s('booking_enabled').toLowerCase());\nif (!booking_enabled && (req.action === 'check_availability' || req.action === 'book_appointment' || req.action === 'check_package_availability' || req.action === 'book_package_appointment')) {\n  return fail(200, 'booking_disabled', 'Online booking is not available for this business right now.');\n}\n\nconst normPhone = raw => {\n  let d = raw.replace(/[^\\d+]/g, '');\n  if ((d.match(/\\+/g) || []).length > 1 || (d.includes('+') && d[0] !== '+')) return null;\n  if (d.startsWith('00')) d = '+' + d.slice(2);\n  else if (d.startsWith('0')) d = '+' + cc + d.slice(1);\n  else if (!d.startsWith('+')) return null;\n  if (d.startsWith('+' + cc + '0')) d = '+' + cc + d.slice(cc.length + 2);\n  return /^\\+[1-9]\\d{7,14}$/.test(d) ? d : null;\n};\n\nconst req2 = { ...req };\nif (req.customer_phone) {\n  req2.customer_phone = normPhone(req.customer_phone);\n  if (!req2.customer_phone) return fail(400, 'bad_phone', 'customer_phone is not a valid phone number. Please include the country code.');\n}\n\nreturn [{ json: { meta, req: req2, cfg: {\n  business_id: req.business_id, name: s('business_name'), tz,\n  services_sheet_id: s('google_services_sheet_id'), faqs_sheet_id: s('google_faqs_sheet_id'), calendar_id: s('google_calendar_id'),\n  hours, slot_interval, min_notice, max_advance_days, cc\n} } }];"
+      },
+      "id": "7d3369a6-8826-4021-837e-3f087a9a0964",
+      "name": "Validate Business",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -12832,
+        -3200
+      ],
+      "notes": "[VERIFY] If DateTime is undefined, add: const { DateTime } = require('luxon'); and set NODE_FUNCTION_ALLOW_EXTERNAL=luxon. booking_enabled now also gates the two package actions."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 1
+          },
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{ !!$json.cfg }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "c4d7cd07-943e-440b-a97e-2f0065f8e091",
+      "name": "Business OK?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        -12608,
+        -3200
+      ]
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 1
+                },
+                "conditions": [
+                  {
+                    "id": "r1",
+                    "leftValue": "={{ $json.req.action }}",
+                    "rightValue": "get_faq",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "get_faq"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 1
+                },
+                "conditions": [
+                  {
+                    "id": "r2",
+                    "leftValue": "={{ $json.req.action }}",
+                    "rightValue": "check_availability",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "check_availability"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 1
+                },
+                "conditions": [
+                  {
+                    "id": "r3",
+                    "leftValue": "={{ $json.req.action }}",
+                    "rightValue": "book_appointment",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "book_appointment"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 1
+                },
+                "conditions": [
+                  {
+                    "id": "r4",
+                    "leftValue": "={{ $json.req.action }}",
+                    "rightValue": "cancel_appointment",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "cancel_appointment"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 1
+                },
+                "conditions": [
+                  {
+                    "id": "r5",
+                    "leftValue": "={{ $json.req.action }}",
+                    "rightValue": "get_current_datetime",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "get_current_datetime"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 1
+                },
+                "conditions": [
+                  {
+                    "id": "r6",
+                    "leftValue": "={{ $json.req.action }}",
+                    "rightValue": "check_package_availability",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "check_package_availability"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 1
+                },
+                "conditions": [
+                  {
+                    "id": "r7",
+                    "leftValue": "={{ $json.req.action }}",
+                    "rightValue": "book_package_appointment",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "book_package_appointment"
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "extra"
+        }
+      },
+      "id": "3d9f2b6a-1886-4bc1-a1ab-9e7a034bb214",
+      "name": "Route Action",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3,
+      "position": [
+        -12384,
+        -3200
+      ],
+      "notes": "7 rule outputs (0-6) + fallback 'Extra Output' (index 7) wired to Finalize Response"
+    },
+    {
+      "parameters": {
+        "documentId": {
+          "__rl": true,
+          "value": "={{ $json.cfg.faqs_sheet_id }}",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "faqs",
+          "mode": "name"
+        },
+        "options": {}
+      },
+      "id": "40f3825a-060c-4566-9d8f-7213fb8b0592",
+      "name": "Read FAQs",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        -12144,
+        -3568
+      ],
+      "alwaysOutputData": true,
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "ESJngjNaYUxqZvmR",
+          "name": "Google Sheets account"
+        }
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "const { req, cfg, meta } = $('Validate Business').first().json;\nconst yes = v => ['true', 'yes', '1'].includes(String(v ?? '').trim().toLowerCase());\n\nconst normalizeRow = (obj) => {\n  const out = {};\n  for (const [k, v] of Object.entries(obj ?? {})) {\n    const nk = String(k).trim().toLowerCase().replace(/[\\s\\-]+/g, '_').replace(/[^a-z0-9_]/g, '');\n    if (nk && !(nk in out)) out[nk] = v;\n  }\n  return out;\n};\n\nconst rows = $input.all().map(i => normalizeRow(i.json)).filter(r => String(r.question ?? '').trim() && String(r.answer ?? '').trim() && yes(r.active));\n\nconst STOP = new Set('a an the is are am was were be do does did i you we me my your our it its of to for in on at and or can could would will what whats how when where which who whom this that there any about tell please have has get with from as if by not no yes'.split(' '));\nconst tok = t => String(t).toLowerCase().normalize('NFKD').replace(/[\\u0300-\\u036f]/g, '').replace(/[^a-z0-9\\s]/g, ' ')\n  .split(/\\s+/).filter(w => w.length > 1 && !STOP.has(w)).map(w => (w.length > 3 && w.endsWith('s') ? w.slice(0, -1) : w));\n\nconst q = new Set(tok(req.query));\nconst NOT_FOUND = \"I don't have that information available right now.\";\nlet best = null;\nif (q.size) {\n  for (const r of rows) {\n    const qt = new Set(tok(`${r.question} ${r.category ?? ''}`)), at = new Set(tok(r.answer));\n    let score = 0, qHits = 0;\n    for (const w of q) { if (qt.has(w)) { score += 1; qHits++; } else if (at.has(w)) score += 0.4; }\n    const cov = score / q.size;\n    if (qHits >= 1 && cov >= 0.6 && (!best || score > best.score || (score === best.score && cov > best.cov))) best = { r, score, cov };\n  }\n}\nconst body = best ? { success: true, answer: String(best.r.answer).trim().slice(0, 1000) } : { success: false, answer: NOT_FOUND };\nreturn [{ json: { meta, req, res: { action: 'get_faq', http: 200, category: best ? 'ok' : 'faq_no_match', body } } }];"
+      },
+      "id": "89e18459-5ee8-4d02-b254-89c6440e3247",
+      "name": "Match FAQ",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -11920,
+        -3408
+      ]
+    },
+    {
+      "parameters": {
+        "documentId": {
+          "__rl": true,
+          "value": "={{ $json.cfg.services_sheet_id }}",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "service",
+          "mode": "name"
+        },
+        "options": {}
+      },
+      "id": "cf4ac19a-6706-48ec-adba-366c412224f9",
+      "name": "Read Services",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        -12112,
+        -3344
+      ],
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "ESJngjNaYUxqZvmR",
+          "name": "Google Sheets account"
+        }
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "const DAYS = ['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun'];\nconst { req, cfg, meta } = $('Validate Business').first().json;\nconst fail = (http, category, msg) => [{ json: { meta, req, res: { action: req.action, http, category, msg } } }];\nconst norm = s => String(s ?? '').toLowerCase().replace(/\\s+/g, ' ').trim();\nconst yes = v => ['true', 'yes', '1'].includes(norm(v));\n\nconst normalizeRow = (obj) => {\n  const out = {};\n  for (const [k, v] of Object.entries(obj ?? {})) {\n    const nk = String(k).trim().toLowerCase().replace(/[\\s\\-]+/g, '_').replace(/[^a-z0-9_]/g, '');\n    if (nk && !(nk in out)) out[nk] = v;\n  }\n  return out;\n};\n\nconst rows = $input.all().map(i => normalizeRow(i.json)).filter(r => norm(r.name) && yes(r.active));\n\nconst want = norm(req.service);\nconst hits = rows.filter(r => {\n  const serviceName = norm(r.name);\n  const aliases = String(r.aliases ?? '').split(/[|,]/).map(norm).filter(Boolean);\n  return serviceName === want || aliases.includes(want);\n});\n\nif (hits.length === 0) {\n  const names = rows.map(r => String(r.name).trim()).slice(0, 10).join(', ');\n  return fail(200, 'service_not_found', names ? `I couldn't find that service. Available services: ${names}.` : \"I couldn't find that service.\");\n}\nif (hits.length > 1) return fail(503, 'duplicate_service_row', \"The requested service has duplicate configuration.\");\n\nconst service = hits[0];\nconst svcName = String(service.name).trim();\n\n// FIX #1: a service with session_minutes set is a multi-session PACKAGE — it must never be\n// booked through this single-session path (it would otherwise book one unbroken block for\n// the full package duration, e.g. one 10-hour sitting). Route it to check_package_availability\n// / book_package_appointment instead.\nif (String(service.session_minutes ?? '').trim()) {\n  return fail(200, 'is_a_package', `${svcName} is a multi-session package — let me check available sessions for it instead of a single slot.`);\n}\n\nconst duration = Number(service.duration);\nif (!Number.isInteger(duration) || duration < 5 || duration > 480) return fail(503, 'bad_service_config', \"The requested service is not configured correctly.\");\n\nconst price = Number(service.price);\nif (!Number.isFinite(price) || price < 0) return fail(503, 'bad_service_price', \"The requested service price is not configured correctly.\");\n\nconst tz = cfg.tz;\nconst start = DateTime.fromISO(`${req.date}T${req.time}`, { zone: tz });\nif (!start.isValid) return fail(400, 'bad_datetime', 'That date or time is not valid.');\n\nconst wall = d => d.toFormat('yyyy-MM-dd HH:mm');\nif (wall(start) !== `${req.date} ${req.time}`) return fail(200, 'nonexistent_local_time', 'That time does not exist on that date because of a clock change. Please choose another time.');\nif (wall(start.plus({ minutes: 60 })) === wall(start) || wall(start.minus({ minutes: 60 })) === wall(start)) {\n  return fail(200, 'ambiguous_local_time', 'That time is ambiguous because of a clock change. Please choose another time.');\n}\n\nconst end = start.plus({ minutes: duration });\nconst now = DateTime.now().setZone(tz);\n\nif (start < now) return fail(200, 'past_time', 'That time has already passed.');\nif (start < now.plus({ minutes: cfg.min_notice })) return fail(200, 'too_soon', 'That time is too soon to book. Please choose a later time.');\nif (start > now.plus({ days: cfg.max_advance_days })) return fail(200, 'too_far_ahead', 'That date is too far in advance to book.');\n\nconst dayKey = DAYS[start.weekday - 1];\nif ((cfg.hours[dayKey] ?? []).length === 0) return fail(200, 'closed_day', 'The business is closed on that day.');\n\nconst startMinutes = start.hour * 60 + start.minute;\nconst endMinutes = end.hour * 60 + end.minute;\nconst openingParts = cfg.hours[dayKey] ?? [];\nconst fitsBusinessHours = openingParts.some(([open, close]) => startMinutes >= open && endMinutes <= close);\nif (!fitsBusinessHours) return fail(200, 'outside_business_hours', 'That appointment would fall outside business hours. Please choose another time.');\n\nconst dayStart = start.startOf('day');\nconst dayEnd = dayStart.plus({ days: 1 }).startOf('day');\nconst base = `https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(cfg.calendar_id)}/events`;\n\nreturn [{ json: { meta, req, cfg,\n  svc: { id: String(service.service_id ?? '').trim(), name: svcName, duration, price },\n  slot: { startMs: start.toMillis(), endMs: end.toMillis(), startIso: start.toISO(), endIso: end.toISO(), dayKey, parts: { year: start.year, month: start.month, day: start.day } },\n  q: { url: base, timeMin: dayStart.toISO(), timeMax: dayEnd.toISO() },\n  key_material: [cfg.business_id, req.customer_phone ?? '', norm(svcName), req.date, req.time, now.toISODate()].join('|')\n} }];"
+      },
+      "id": "c1019191-f8ed-484a-aca6-b3fbc151eaf1",
+      "name": "Resolve Service",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -11920,
+        -3200
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 1
+          },
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{ !!$json.slot }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "ce2c5ace-2348-4143-8790-e811550d2e55",
+      "name": "Slot Prep OK?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        -11696,
+        -3200
+      ]
+    },
+    {
+      "parameters": {
+        "type": "SHA256",
+        "value": "={{ $json.key_material }}",
+        "dataPropertyName": "booking_key"
+      },
+      "id": "2e35a30b-2eb5-44db-9538-6a028fbec38b",
+      "name": "Compute Booking Key",
+      "type": "n8n-nodes-base.crypto",
+      "typeVersion": 1,
+      "position": [
+        -11472,
+        -3200
+      ],
+      "notes": "If field labels differ on your version, replace with a Set node: booking_key = {{ $json.key_material.hash('sha256') }}"
+    },
+    {
+      "parameters": {
+        "url": "={{ $json.q.url }}",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleApi",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "timeMin",
+              "value": "={{ $json.q.timeMin }}"
+            },
+            {
+              "name": "timeMax",
+              "value": "={{ $json.q.timeMax }}"
+            },
+            {
+              "name": "singleEvents",
+              "value": "true"
+            },
+            {
+              "name": "orderBy",
+              "value": "startTime"
+            },
+            {
+              "name": "maxResults",
+              "value": "250"
+            },
+            {
+              "name": "fields",
+              "value": "items(id,status,summary,description,start,end,transparency),nextPageToken"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 6000
+        }
+      },
+      "id": "89c83670-fa1e-4f26-8bd4-bf91f9b809b3",
+      "name": "List Events (Slot)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -11264,
+        -3200
+      ],
+      "credentials": {
+        "googleApi": {
+          "id": "cevWjRhyLBhJsO2U",
+          "name": "Google Service Account account"
+        }
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "const c = $('Compute Booking Key').first().json;\nconst { req, cfg, svc, slot, meta, booking_key } = c;\nconst list = $input.first().json;\nconst tz = cfg.tz;\nconst fail = (http, category, msg) => [{ json: { meta, req, res: { action: req.action, http, category, msg } } }];\nconst norm = s => String(s ?? '').toLowerCase().replace(/\\s+/g, ' ').trim();\nconst field = (d, k) => { const m = new RegExp('(?:^|\\\\n|<br\\\\s*/?>)\\\\s*' + k + ':\\\\s*([^\\\\n<]*)', 'i').exec(String(d ?? '')); return m ? m[1].trim() : ''; };\nconst fmt = ms => DateTime.fromMillis(ms, { zone: tz }).toFormat('HH:mm');\n\nif (list.nextPageToken) return fail(503, 'calendar_incomplete_data');\n\nconst busy = [];\nfor (const e of list.items ?? []) {\n  if (e.status === 'cancelled' || e.transparency === 'transparent') continue;\n  if (e.start?.dateTime && e.end?.dateTime) busy.push({ s: Date.parse(e.start.dateTime), e: Date.parse(e.end.dateTime), ev: e });\n  else if (e.start?.date && e.end?.date) busy.push({ s: DateTime.fromISO(e.start.date, { zone: tz }).startOf('day').toMillis(), e: DateTime.fromISO(e.end.date, { zone: tz }).startOf('day').toMillis(), ev: e });\n  else return fail(503, 'calendar_bad_event_shape');\n}\n\nif (req.action === 'book_appointment') {\n  const dup = busy.find(b => b.s === slot.startMs && field(b.ev.description, 'Business ID') === cfg.business_id && field(b.ev.description, 'Customer Phone') === req.customer_phone && norm(field(b.ev.description, 'Service')) === norm(svc.name));\n  if (dup) return [{ json: { meta, req, res: { action: req.action, http: 200, category: 'idempotent_replay', body: { success: true, message: `Your ${svc.name} appointment is booked for ${req.date} at ${req.time}.`, appointment_id: dup.ev.id } } } }];\n}\n\nconst DUR = svc.duration * 60000;\nconst at = m => DateTime.fromObject({ ...slot.parts, hour: Math.floor(m / 60), minute: m % 60 }, { zone: tz }).toMillis();\nconst spans = (cfg.hours[slot.dayKey] ?? []).map(([a, z]) => [at(a), at(z)]);\nconst earliest = Date.now() + cfg.min_notice * 60000;\nconst overlaps = (s, e) => busy.some(b => s < b.e && e > b.s);\nconst inHours = s => spans.some(([a, z]) => s >= a && s + DUR <= z);\nconst fits = s => s >= earliest && inHours(s) && !overlaps(s, s + DUR);\n\nconst reqFits = fits(slot.startMs);\nconst step = cfg.slot_interval * 60000, cands = [];\nfor (const [a, z] of spans) for (let t = a; t + DUR <= z; t += step) if (fits(t)) cands.push(t);\nconst others = cands.filter(t => t !== slot.startMs).sort((x, y) => Math.abs(x - slot.startMs) - Math.abs(y - slot.startMs)).slice(0, reqFits ? 4 : 5);\nconst times = [...others, ...(reqFits ? [slot.startMs] : [])].sort((x, y) => x - y).map(fmt);\nconst tail = times.length ? ` Available times that day: ${times.join(', ')}.` : ' There are no other available times that day.';\n\nif (req.action === 'check_availability') {\n  if (reqFits) return [{ json: { meta, req, res: { action: req.action, http: 200, category: 'ok', body: { available: true, available_times: times, message: 'The requested time is available.' } } } }];\n  const [cat, m] = !inHours(slot.startMs) ? ['outside_hours', 'That time is outside opening hours.'] : ['slot_unavailable', 'That time is not available.'];\n  return [{ json: { meta, req, res: { action: req.action, http: 200, category: cat, body: { available: false, available_times: times, message: m + tail } } } }];\n}\n\nif (!reqFits) {\n  const [cat, m] = !inHours(slot.startMs) ? ['outside_hours', 'That time is outside opening hours.'] : ['slot_unavailable', 'That time is no longer available.'];\n  return fail(200, cat, m + tail);\n}\nconst description = [`Customer Name: ${req.customer_name}`, `Customer Phone: ${req.customer_phone}`, `Customer Email: ${req.customer_email ?? ''}`, `Business ID: ${cfg.business_id}`, `Service: ${svc.name}`].join('\\n');\nreturn [{ json: { meta, req, cfg, svc, slot, q: c.q, booking_key, proceed: true, event: { id: booking_key, summary: `${svc.name} - ${req.customer_name}`, description, start: { dateTime: slot.startIso, timeZone: tz }, end: { dateTime: slot.endIso, timeZone: tz } } } }];"
+      },
+      "id": "b4355d18-449e-4483-9f8f-fc1772432bad",
+      "name": "Evaluate Slot",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -11040,
+        -3200
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 1
+          },
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{ $json.proceed }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "4748d079-2447-4000-b1b8-fb517a2c0f72",
+      "name": "Ready To Insert?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        -10816,
+        -3200
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.q.url }}",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleApi",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.event) }}",
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true,
+              "responseFormat": "json"
+            }
+          },
+          "timeout": 8000
+        }
+      },
+      "id": "57b1ad4f-4412-42e2-b42c-ef54a89235b5",
+      "name": "Insert Event",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -10592,
+        -3200
+      ],
+      "credentials": {
+        "googleApi": {
+          "id": "cevWjRhyLBhJsO2U",
+          "name": "Google Service Account account"
+        }
+      },
+      "onError": "continueErrorOutput",
+      "notes": "Options: Include Response Headers and Status = ON, Never Error = ON. Retry On Fail = OFF."
+    },
+    {
+      "parameters": {
+        "jsCode": "const prev = $('Evaluate Slot').first().json;\nconst { req, meta, booking_key, svc } = prev;\nconst r = $input.first().json, code = Number(r.statusCode), body = r.body ?? {};\nconst done = (http, category, extra) => [{ json: { meta, req, res: { action: 'book_appointment', http, category, ...extra } } }];\n\nif (code === 200 && body.status === 'confirmed' && body.id === booking_key) return done(200, 'ok', { body: { success: true, message: `Your ${svc.name} appointment has been booked for ${req.date} at ${req.time}.`, appointment_id: body.id } });\nif (code === 409) return [{ json: { ...prev, need_existing: true } }];\n\nconst reason = JSON.stringify(body?.error?.errors ?? '');\nlet category = 'booking_failed';\nif (code === 401) category = 'google_auth';\nelse if (code === 403) category = /rate|quota/i.test(reason) ? 'google_rate_limit' : 'google_auth';\nelse if (code === 404) category = 'google_calendar_not_found';\nelse if (code === 429) category = 'google_rate_limit';\nelse if (code >= 500) category = 'google_unavailable';\nreturn done(503, category, {});"
+      },
+      "id": "d42c01f3-ed4a-4907-8420-86c86090b5fb",
+      "name": "Interpret Insert",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -10384,
+        -3200
+      ],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 1
+          },
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{ $json.need_existing }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "570b7e9a-c1c2-491b-891c-65936318190e",
+      "name": "Need Existing Check?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        -10160,
+        -3200
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{ $json.q.url + '/' + $json.booking_key }}",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleApi",
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true,
+              "responseFormat": "json"
+            }
+          },
+          "timeout": 8000
+        }
+      },
+      "id": "e8e55e18-e757-40ae-b3f9-9a5df2180b51",
+      "name": "Get Existing Event",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -9936,
+        -3296
+      ],
+      "credentials": {
+        "googleApi": {
+          "id": "cevWjRhyLBhJsO2U",
+          "name": "Google Service Account account"
+        }
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "const prev = $('Interpret Insert').first().json;\nconst { req, meta, cfg, svc, booking_key } = prev;\nconst r = $input.first().json, code = Number(r.statusCode), ev = r.body ?? {};\nconst field = (d, k) => { const m = new RegExp('(?:^|\\\\n|<br\\\\s*/?>)\\\\s*' + k + ':\\\\s*([^\\\\n<]*)', 'i').exec(String(d ?? '')); return m ? m[1].trim() : ''; };\nconst done = (http, category, extra) => [{ json: { meta, req, res: { action: 'book_appointment', http, category, ...extra } } }];\n\nif (code === 200 && ev.status === 'confirmed' && ev.id === booking_key && field(ev.description, 'Business ID') === cfg.business_id && field(ev.description, 'Customer Phone') === req.customer_phone) return done(200, 'idempotent_replay', { body: { success: true, message: `Your ${svc.name} appointment is booked for ${req.date} at ${req.time}.`, appointment_id: ev.id } });\nif (code === 200 && ev.status === 'cancelled') return done(503, 'id_collision_cancelled_event', {});\nreturn done(503, 'booking_failed', {});"
+      },
+      "id": "c25273f1-adcd-49b5-8b5c-a347a54d0def",
+      "name": "Interpret Existing",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -9712,
+        -3296
+      ],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "const { req, cfg, meta } = $input.first().json;\nconst d = DateTime.fromISO(req.appointment_date, { zone: cfg.tz });\nconst dayStart = d.startOf('day'), dayEnd = dayStart.plus({ days: 1 }).startOf('day');\nif (dayEnd.toMillis() <= Date.now()) return [{ json: { meta, req, res: { action: req.action, http: 200, category: 'past_date', msg: 'I can only cancel upcoming appointments.' } } }];\nconst base = `https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(cfg.calendar_id)}/events`;\nreturn [{ json: { meta, req, cfg, q: { url: base, timeMin: dayStart.toISO(), timeMax: dayEnd.toISO() } } }];"
+      },
+      "id": "82202fcc-7357-4aab-8451-37889c4433f1",
+      "name": "Prepare Cancel Query",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -12144,
+        -2960
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 1
+          },
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{ !!$json.q }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "a3936235-302f-4cc9-a7a0-b0e2291d4865",
+      "name": "Query OK?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        -11920,
+        -2960
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{ $json.q.url }}",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleApi",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "timeMin",
+              "value": "={{ $json.q.timeMin }}"
+            },
+            {
+              "name": "timeMax",
+              "value": "={{ $json.q.timeMax }}"
+            },
+            {
+              "name": "singleEvents",
+              "value": "true"
+            },
+            {
+              "name": "orderBy",
+              "value": "startTime"
+            },
+            {
+              "name": "maxResults",
+              "value": "250"
+            },
+            {
+              "name": "fields",
+              "value": "items(id,status,summary,description,start,end,transparency),nextPageToken"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 6000
+        }
+      },
+      "id": "68d1ce59-2e91-4f74-908d-3f0a9cf068f3",
+      "name": "List Events (Cancel)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -11696,
+        -2960
+      ],
+      "credentials": {
+        "googleApi": {
+          "id": "cevWjRhyLBhJsO2U",
+          "name": "Google Service Account account"
+        }
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "const p = $('Prepare Cancel Query').first().json;\nconst { req, cfg, meta } = p;\nconst list = $input.first().json;\nconst fail = (http, category, msg) => [{ json: { meta, req, res: { action: req.action, http, category, msg } } }];\nconst norm = s => String(s ?? '').toLowerCase().replace(/\\s+/g, ' ').trim();\nconst field = (d, k) => { const m = new RegExp('(?:^|\\\\n|<br\\\\s*/?>)\\\\s*' + k + ':\\\\s*([^\\\\n<]*)', 'i').exec(String(d ?? '')); return m ? m[1].trim() : ''; };\n\nif (list.nextPageToken) return fail(503, 'calendar_incomplete_data');\nconst now = Date.now();\nconst matches = (list.items ?? []).filter(e => {\n  if (e.status === 'cancelled' || !e.start?.dateTime) return false;\n  const s = Date.parse(e.start.dateTime); if (s < now) return false;\n  const st = DateTime.fromMillis(s, { zone: cfg.tz });\n  if (st.toISODate() !== req.appointment_date) return false;\n  if (field(e.description, 'Business ID') !== cfg.business_id) return false;\n  if (field(e.description, 'Customer Phone') !== req.customer_phone) return false;\n  if (req.service && norm(field(e.description, 'Service')) !== norm(req.service)) return false;\n  if (req.appointment_time && st.toFormat('HH:mm') !== req.appointment_time) return false;\n  return true;\n});\nif (matches.length === 0) return fail(200, 'appointment_not_found', \"I couldn't find an appointment matching those details.\");\nif (matches.length > 1) return fail(200, 'multiple_matches', 'I found more than one appointment on that date. Please tell me the service and the appointment time, or contact the business directly.');\nreturn [{ json: { meta, req, cfg, delete_url: `${p.q.url}/${encodeURIComponent(matches[0].id)}` } }];"
+      },
+      "id": "508dfbb0-4485-464d-b4ae-d1e91c4ef3ab",
+      "name": "Match Cancellation",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -11472,
+        -2960
+      ],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 1
+          },
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{ !!$json.delete_url }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "11ba2d29-b119-4552-ae30-9bc9c134466f",
+      "name": "One Match?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        -11264,
+        -2960
+      ]
+    },
+    {
+      "parameters": {
+        "method": "DELETE",
+        "url": "={{ $json.delete_url }}",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleApi",
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true,
+              "responseFormat": "json"
+            }
+          },
+          "timeout": 8000
+        }
+      },
+      "id": "0f10fcbd-e130-4fdd-a841-970e10b56a3c",
+      "name": "Delete Event",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -11040,
+        -2960
+      ],
+      "credentials": {
+        "googleApi": {
+          "id": "cevWjRhyLBhJsO2U",
+          "name": "Google Service Account account"
+        }
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "const { req, meta } = $('Match Cancellation').first().json;\nconst r = $input.first().json, code = Number(r.statusCode);\nconst done = (http, category, extra) => [{ json: { meta, req, res: { action: 'cancel_appointment', http, category, ...extra } } }];\nif (code === 204 || code === 200) return done(200, 'ok', { body: { success: true, message: 'The appointment has been cancelled.' } });\nif (code === 404 || code === 410) return done(200, 'appointment_not_found', { msg: \"I couldn't find that appointment. It may already have been cancelled.\" });\nconst reason = JSON.stringify(r.body?.error?.errors ?? '');\nlet category = 'cancel_failed';\nif (code === 401) category = 'google_auth';\nelse if (code === 403) category = /rate|quota/i.test(reason) ? 'google_rate_limit' : 'google_auth';\nelse if (code === 429) category = 'google_rate_limit';\nelse if (code >= 500) category = 'google_unavailable';\nreturn done(503, category, {});"
+      },
+      "id": "d4cb2cda-3436-4b8b-87f9-9ea145364b63",
+      "name": "Interpret Delete",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -10816,
+        -2960
+      ],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "const { req, cfg, meta } = $input.first().json;\nconst now = DateTime.now().setZone(cfg.tz);\nreturn [{ json: { meta, req, res: { action: 'get_current_datetime', http: 200, category: 'ok', body: {\n  success: true,\n  date: now.toFormat('yyyy-MM-dd'),\n  time: now.toFormat('HH:mm'),\n  day_of_week: now.toFormat('EEEE'),\n  datetime: now.toFormat('yyyy-MM-dd HH:mm'),\n  timezone: cfg.tz\n} } } }];"
+      },
+      "id": "c0a76b0c-11db-41a0-ae1f-d492849a0ea1",
+      "name": "Build Current DateTime",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -12144,
+        -3104
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const ctx = (() => { for (const n of ['Validate Business', 'Validate Request']) { try { return $(n).first().json; } catch (e) {} } return {}; })();\nconst raw = JSON.stringify($input.first().json?.error ?? $input.first().json ?? '').slice(0, 1000);\nlet category = 'google_unavailable', http = 503;\nif (/timed? ?out|ETIMEDOUT|ESOCKETTIMEDOUT|ECONNABORTED/i.test(raw)) { category = 'timeout'; http = 504; }\nelse if (/429|rate ?limit|quota/i.test(raw)) category = 'google_rate_limit';\nelse if (/401|invalid_grant|invalid_client|unauthori[sz]ed|authentication/i.test(raw)) category = 'google_auth';\nelse if (/403|forbidden|404|not found|unable to parse range|permission/i.test(raw)) category = 'google_config_or_permission';\nreturn [{ json: { meta: ctx.meta, req: ctx.req, res: { action: ctx.req?.action ?? '_unknown', http, category } } }];"
+      },
+      "id": "7e92ff9d-de30-4ea5-a7c4-f8ed29381001",
+      "name": "Build Error Response",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -12144,
+        -2608
+      ],
+      "notes": "Never exposes raw Google error text; used for classification only"
+    },
+    {
+      "parameters": {
+        "jsCode": "const j = $input.first().json;\nconst res = j.res ?? { action: '_unknown', http: 500, category: 'internal_error' };\nconst a = res.action;\nconst TECH = {\n  get_faq: \"I couldn't look that up right now.\",\n  check_availability: \"I couldn't check availability right now.\",\n  book_appointment: \"I couldn't complete the booking right now.\",\n  cancel_appointment: \"I couldn't cancel the appointment right now.\",\n  get_current_datetime: \"I couldn't get the current date and time right now.\",\n  check_package_availability: \"I couldn't check package availability right now.\",\n  book_package_appointment: \"I couldn't complete the package booking right now.\",\n  _unknown: 'Something went wrong.',\n};\nconst msg = res.msg || TECH[a] || TECH._unknown;\nconst FAIL = {\n  get_faq: () => ({ success: false, answer: msg }),\n  check_availability: () => ({ available: false, available_times: [], message: msg }),\n  book_appointment: () => ({ success: false, message: msg }),\n  cancel_appointment: () => ({ success: false, message: msg }),\n  get_current_datetime: () => ({ success: false, message: msg }),\n  check_package_availability: () => ({ available: false, sessions: [], message: msg }),\n  book_package_appointment: () => ({ success: false, message: msg }),\n  _unknown: () => ({ success: false, message: msg }),\n};\nconst SHAPE = {\n  get_faq: b => (typeof b.success === 'boolean' && typeof b.answer === 'string') ? { success: b.success, answer: b.answer } : null,\n  check_availability: b => (typeof b.available === 'boolean' && Array.isArray(b.available_times) && typeof b.message === 'string') ? { available: b.available, available_times: b.available_times.map(String), message: b.message } : null,\n  book_appointment: b => (typeof b.success === 'boolean' && typeof b.message === 'string') ? (b.appointment_id ? { success: b.success, message: b.message, appointment_id: String(b.appointment_id) } : { success: b.success, message: b.message }) : null,\n  cancel_appointment: b => (typeof b.success === 'boolean' && typeof b.message === 'string') ? { success: b.success, message: b.message } : null,\n  get_current_datetime: b => (typeof b.success === 'boolean' && typeof b.date === 'string' && typeof b.time === 'string') ? { success: b.success, date: b.date, time: b.time, day_of_week: String(b.day_of_week ?? ''), datetime: String(b.datetime ?? ''), timezone: String(b.timezone ?? '') } : null,\n  check_package_availability: b => (typeof b.available === 'boolean' && Array.isArray(b.sessions) && typeof b.message === 'string') ? { available: b.available, sessions: b.sessions, message: b.message, ...(b.price !== undefined ? { price: b.price } : {}) } : null,\n  book_package_appointment: b => (typeof b.success === 'boolean' && typeof b.message === 'string') ? { success: b.success, message: b.message, ...(Array.isArray(b.sessions) ? { sessions: b.sessions } : {}), ...(b.price !== undefined ? { price: b.price } : {}) } : null,\n};\nlet http = Number(res.http) || 500, category = res.category ?? 'internal_error';\nlet body = res.body && SHAPE[a] ? SHAPE[a](res.body) : null;\nif (!body) {\n  if (res.body) { http = 500; category = 'contract_violation'; }\n  body = (FAIL[a] ?? FAIL._unknown)();\n}\nconst ok = category === 'ok' || category === 'idempotent_replay';\nconst log = { ts: new Date().toISOString(), request_id: j.meta?.request_id ?? null, business_id: j.req?.business_id ?? null, action: a, http, outcome: ok ? 'success' : 'failure', category, duration_ms: Date.now() - (j.meta?.started_at ?? Date.now()) };\nconsole.log(JSON.stringify(log));\nreturn [{ json: { http, body, log, persist: a === 'book_appointment' || a === 'book_package_appointment' || a === 'cancel_appointment' || http >= 400 } }];"
+      },
+      "id": "f8de2acf-2170-4cef-92bc-0bbe379a0f9a",
+      "name": "Finalize Response",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -11920,
+        -2608
+      ],
+      "notes": "MODIFIED: TECH/FAIL/SHAPE and persist now cover check_package_availability and book_package_appointment."
+    },
+    {
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "={{ JSON.stringify($json.body) }}",
+        "options": {
+          "responseCode": "={{ $json.http }}",
+          "responseHeaders": {
+            "entries": [
+              {
+                "name": "Content-Type",
+                "value": "application/json; charset=utf-8"
+              },
+              {
+                "name": "Cache-Control",
+                "value": "no-store"
+              }
+            ]
+          }
+        }
+      },
+      "id": "b85c71c0-2370-47aa-b5e1-9d647aabad3a",
+      "name": "Respond to Webhook",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        -11696,
+        -2608
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 1
+          },
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{ $json.persist }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "798d4e72-2753-47d0-84b2-6b49d4ccce3d",
+      "name": "Should Persist Log?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        -11472,
+        -2608
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "1XV349TM6PmwfFgRaSzo2_bOchY-tbLbvUIUyZBs56l0",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": 1349401687,
+          "mode": "list",
+          "cachedResultName": "registry-logs-template.csv",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1XV349TM6PmwfFgRaSzo2_bOchY-tbLbvUIUyZBs56l0/edit#gid=1349401687"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "ts": "={{ $json.log.ts }}",
+            "request_id": "={{ $json.log.request_id }}",
+            "business_id": "={{ $json.log.business_id }}",
+            "action": "={{ $json.log.action }}",
+            "http": "={{ $json.log.http }}",
+            "outcome": "={{ $json.log.outcome }}",
+            "category": "={{ $json.log.category }}",
+            "duration_ms": "={{ $json.log.duration_ms }}"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "ts",
+              "displayName": "ts",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "request_id",
+              "displayName": "request_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "business_id",
+              "displayName": "business_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "action",
+              "displayName": "action",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "http",
+              "displayName": "http",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "outcome",
+              "displayName": "outcome",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "category",
+              "displayName": "category",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "duration_ms",
+              "displayName": "duration_ms",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "id": "9e5831be-cf27-4666-852a-ec0a036cfd42",
+      "name": "Append Log Row",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        -11264,
+        -2608
+      ],
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "ESJngjNaYUxqZvmR",
+          "name": "Google Sheets account"
+        }
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 1
+          },
+          "conditions": [
+            {
+              "id": "nc1",
+              "leftValue": "={{ $json.res && $json.res.category }}",
+              "rightValue": "ok",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "1fd512f6-ddfd-4523-a02a-0d3162c34a56",
+      "name": "Booking Just Created?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        -10160,
+        -3072
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const business = $('Load Business').first().json;\nconst evalSlot = $('Evaluate Slot').first().json;\nconst insertResult = $('Insert Event').first().json;\nconst req = evalSlot.req;\nconst svc = evalSlot.svc;\nconst slot = evalSlot.slot;\nconst tz = evalSlot.cfg.tz;\n\nfunction fmtDate(iso) {\n  const d = new Date(iso);\n  if (isNaN(d)) return iso;\n  return d.toLocaleDateString('en-GB', { weekday: 'long', day: 'numeric', month: 'long', timeZone: tz });\n}\nfunction fmtTime(iso) {\n  const d = new Date(iso);\n  if (isNaN(d)) return '';\n  return d.toLocaleTimeString('en-GB', { hour: 'numeric', minute: '2-digit', hour12: true, timeZone: tz });\n}\n\nreturn [{\n  json: {\n    business_name: business.business_name || '',\n    business_email: business.business_email || '',\n    business_phone: business.business_phone || '',\n    business_location: business.business_location || '',\n    customer_name: req.customer_name || '',\n    customer_phone: req.customer_phone || '',\n    customer_email: req.customer_email || '',\n    service: svc.name,\n    date_display: fmtDate(slot.startIso),\n    time_display: `${fmtTime(slot.startIso)} - ${fmtTime(slot.endIso)}`,\n    calendar_link: (insertResult.body && insertResult.body.htmlLink) || ''\n  }\n}];"
+      },
+      "id": "b2cdb4eb-aeec-4c43-88d9-60de58e7ba6c",
+      "name": "Prepare Notification Data",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -9936,
+        -3136
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://127.0.0.1:11434/api/generate",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ model: 'llama3.2:3b', stream: false, format: 'json', prompt: `You are writing two short, warm, professional booking emails in plain text (no markdown). Return ONLY valid JSON with exactly these keys: customer_subject, customer_body, owner_subject, owner_body.\\n\\nBusiness: ${$json.business_name}\\nService: ${$json.service}\\nDate: ${$json.date_display}\\nTime: ${$json.time_display}\\nCustomer name: ${$json.customer_name}\\nCustomer phone: ${$json.customer_phone}\\nCustomer email: ${$json.customer_email}\\nCalendar link: ${$json.calendar_link}\\n\\ncustomer_body: confirm the booking, thank the customer, list service/date/time/business name and address (${$json.business_location}), and give the business phone (${$json.business_phone}) for rescheduling. Sign off from the ${$json.business_name} team.\\n\\nowner_body: tell the owner a new booking came in, list the same details plus customer phone and email, and put the calendar link on its own line: ${$json.calendar_link}` }) }}",
+        "options": {}
+      },
+      "id": "842cfa72-6648-4992-99df-120bf5ed6adf",
+      "name": "Generate Emails (Ollama)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -9712,
+        -3136
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const b = $('Prepare Notification Data').first().json;\nlet ai = {};\ntry {\n  ai = JSON.parse($input.first().json.response);\n} catch (e) {\n  ai = {};\n}\n\nconst fallback = {\n  customer_subject: `Booking Confirmed - ${b.service} at ${b.business_name}`,\n  customer_body: `Hi ${b.customer_name},\\n\\nYour booking is confirmed.\\n\\nService: ${b.service}\\nDate: ${b.date_display}\\nTime: ${b.time_display}\\nLocation: ${b.business_location}\\n\\nNeed to reschedule? Call us on ${b.business_phone}.\\n\\nSee you soon,\\n${b.business_name}`,\n  owner_subject: `New Booking - ${b.customer_name} (${b.service})`,\n  owner_body: `A new booking was made.\\n\\nCustomer: ${b.customer_name}\\nPhone: ${b.customer_phone}\\nEmail: ${b.customer_email}\\nService: ${b.service}\\nDate: ${b.date_display}\\nTime: ${b.time_display}\\n\\nCalendar: ${b.calendar_link}`\n};\n\nreturn [{\n  json: {\n    ...b,\n    customer_subject: ai.customer_subject || fallback.customer_subject,\n    customer_body: ai.customer_body || fallback.customer_body,\n    owner_subject: ai.owner_subject || fallback.owner_subject,\n    owner_body: ai.owner_body || fallback.owner_body\n  }\n}];"
+      },
+      "id": "fca8691b-1f02-4796-af18-672101c21b36",
+      "name": "Parse AI Emails",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -9488,
+        -3136
+      ]
+    },
+    {
+      "parameters": {
+        "fromEmail": "YOUR_VERIFIED_SENDER@yourdomain.com",
+        "toEmail": "={{ $json.customer_email }}",
+        "subject": "={{ $json.customer_subject }}",
+        "emailFormat": "text",
+        "text": "={{ $json.customer_body }}",
+        "options": {}
+      },
+      "id": "59243d2d-93a3-4e3a-bd05-3a037f9b3738",
+      "name": "Email Customer",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [
+        -9264,
+        -3232
+      ],
+      "webhookId": "2838d6eb-4b67-4570-8dcc-3324e6b91a2e",
+      "credentials": {
+        "smtp": {
+          "id": "xtRMvWqG00ZcXrpb",
+          "name": "SMTP account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "fromEmail": "YOUR_VERIFIED_SENDER@yourdomain.com",
+        "toEmail": "={{ $json.business_email }}",
+        "subject": "={{ $json.owner_subject }}",
+        "emailFormat": "text",
+        "text": "={{ $json.owner_body }}",
+        "options": {}
+      },
+      "id": "839d4c14-3fe5-41ae-ab49-cfe2f68346b3",
+      "name": "Email Business Owner",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [
+        -9264,
+        -3024
+      ],
+      "webhookId": "d3b11474-9f21-4a00-ac6e-3189d3f334a8",
+      "credentials": {
+        "smtp": {
+          "id": "xtRMvWqG00ZcXrpb",
+          "name": "SMTP account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 1
+          },
+          "conditions": [
+            {
+              "id": "p1",
+              "leftValue": "={{ $('Validate Business').first().json.req.action }}",
+              "rightValue": "package",
+              "operator": {
+                "type": "string",
+                "operation": "contains"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "015f25f1-246c-4653-a726-591590159e03",
+      "name": "Package Action?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        -12112,
+        -3552
+      ],
+      "notes": "True for check_package_availability / book_package_appointment. Sits between Read Services and the two Resolve* nodes."
+    },
+    {
+      "parameters": {
+        "jsCode": "const { req, cfg, meta } = $('Validate Business').first().json;\nconst fail = (http, category, msg) => [{ json: { meta, req, res: { action: req.action, http, category, msg } } }];\nconst norm = s => String(s ?? '').toLowerCase().replace(/\\s+/g, ' ').trim();\nconst yes = v => ['true', 'yes', '1'].includes(norm(v));\n\nconst normalizeRow = (obj) => {\n  const out = {};\n  for (const [k, v] of Object.entries(obj ?? {})) {\n    const nk = String(k).trim().toLowerCase().replace(/[\\s\\-]+/g, '_').replace(/[^a-z0-9_]/g, '');\n    if (nk && !(nk in out)) out[nk] = v;\n  }\n  return out;\n};\n\nconst rows = $input.all().map(i => normalizeRow(i.json)).filter(r => norm(r.name) && yes(r.active));\nconst want = norm(req.service);\nconst hits = rows.filter(r => {\n  const serviceName = norm(r.name);\n  const aliases = String(r.aliases ?? '').split(/[|,]/).map(norm).filter(Boolean);\n  return serviceName === want || aliases.includes(want);\n});\n\nif (hits.length === 0) {\n  const names = rows.map(r => String(r.name).trim()).slice(0, 10).join(', ');\n  return fail(200, 'service_not_found', names ? `I couldn't find that service. Available services: ${names}.` : \"I couldn't find that service.\");\n}\nif (hits.length > 1) return fail(503, 'duplicate_service_row', 'The requested service has duplicate configuration.');\n\nconst service = hits[0];\nconst svcName = String(service.name).trim();\nconst s = k => String(service[k] ?? '').trim();\n\n// IMPORTANT: 'duration' must be stored in MINUTES (e.g. 600 for a 10-hour package), same\n// column the single-session flow (Resolve Service) already reads. 'session_minutes' is a\n// NEW optional column: the max length of one sitting (e.g. 120 for a 2-hour daily lesson).\n// Leave session_minutes blank for services that always fit in one sitting.\nconst durationMin = Number(s('duration'));\nif (!Number.isInteger(durationMin) || durationMin < 5 || durationMin > 3000) return fail(503, 'bad_service_config', 'The requested service is not configured correctly.');\n\nlet sessionMin = s('session_minutes') ? Number(s('session_minutes')) : durationMin;\nif (!Number.isInteger(sessionMin) || sessionMin < 5 || sessionMin > durationMin) return fail(503, 'bad_service_config', 'The requested service session length is not configured correctly.');\n\nconst price = Number(s('price'));\nif (!Number.isFinite(price) || price < 0) return fail(503, 'bad_service_price', 'The requested service price is not configured correctly.');\n\nconst sessionsNeeded = Math.ceil(durationMin / sessionMin);\nconst lengths = [];\nlet remaining = durationMin;\nfor (let i = 0; i < sessionsNeeded; i++) {\n  const len = Math.min(sessionMin, remaining);\n  lengths.push(len);\n  remaining -= len;\n}\n\nif (sessionsNeeded <= 1) return fail(200, 'not_a_package', 'That service fits in a single session, so please use the regular booking flow for it instead.');\n\nconst tz = cfg.tz;\nconst start = DateTime.fromISO(req.start_date, { zone: tz });\nif (!start.isValid) return fail(400, 'bad_date', 'That start date is not valid.');\n\nconst now = DateTime.now().setZone(tz);\nif (start.startOf('day') < now.startOf('day')) return fail(200, 'past_date', 'That start date has already passed.');\nif (start.startOf('day') > now.plus({ days: cfg.max_advance_days }).startOf('day')) return fail(200, 'too_far_ahead', 'That start date is too far in advance to book.');\n\nlet daysFilter = null;\nif (req.days_of_week) daysFilter = req.days_of_week.split(',');\n\n// Search window: generous enough to find every session even with a restrictive days_of_week\n// filter or business closures, capped by the business's own max_advance_days.\nconst windowDays = Math.max(14, Math.min(cfg.max_advance_days, sessionsNeeded * 21));\nconst windowStart = start.startOf('day');\nconst windowEnd = windowStart.plus({ days: windowDays }).startOf('day');\n\nconst base = `https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(cfg.calendar_id)}/events`;\n\nreturn [{ json: { meta, req, cfg,\n  svc: { name: svcName, durationMin, sessionMin, lengths, price },\n  search: { startDate: req.start_date, sessionTime: req.session_time, daysFilter, windowDays },\n  q: { url: base, timeMin: windowStart.toISO(), timeMax: windowEnd.toISO() }\n} }];"
+      },
+      "id": "64acf8d8-b28f-425c-beaa-20a76097f15d",
+      "name": "Resolve Package Service",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -11920,
+        -3712
+      ],
+      "notes": "Assumes exactly ONE session per open calendar day, all at the same session_time. That matches 'split 10 hours into 5 days of 2 hours' — see chat notes for how to relax this."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 1
+          },
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{ !!$json.svc }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "597d694a-21a6-4a85-84c5-254aa5304e72",
+      "name": "Package Slot Prep OK?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        -11696,
+        -3712
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{ $json.q.url }}",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleApi",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "timeMin",
+              "value": "={{ $json.q.timeMin }}"
+            },
+            {
+              "name": "timeMax",
+              "value": "={{ $json.q.timeMax }}"
+            },
+            {
+              "name": "singleEvents",
+              "value": "true"
+            },
+            {
+              "name": "orderBy",
+              "value": "startTime"
+            },
+            {
+              "name": "maxResults",
+              "value": "2500"
+            },
+            {
+              "name": "fields",
+              "value": "items(id,status,summary,description,start,end,transparency),nextPageToken"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 8000
+        }
+      },
+      "id": "c62a8e70-ac15-4f5b-aaa0-04f6ab193f35",
+      "name": "List Events (Package)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -11472,
+        -3712
+      ],
+      "credentials": {
+        "googleApi": {
+          "id": "cevWjRhyLBhJsO2U",
+          "name": "Google Service Account account"
+        }
+      },
+      "onError": "continueErrorOutput",
+      "notes": "maxResults raised to 2500 vs the single-day query since this spans up to windowDays days. If nextPageToken still appears for a very busy calendar, this fails safe (see Compute Package Sessions)."
+    },
+    {
+      "parameters": {
+        "jsCode": "const DAYS = ['mon','tue','wed','thu','fri','sat','sun'];\nconst p = $('Resolve Package Service').first().json;\nconst { req, cfg, svc, search, meta } = p;\nconst list = $input.first().json;\nconst tz = cfg.tz;\nconst fail = (http, category, msg) => [{ json: { meta, req, res: { action: req.action, http, category, msg } } }];\n\nif (list.nextPageToken) return fail(503, 'calendar_incomplete_data');\n\nconst busy = [];\nfor (const e of list.items ?? []) {\n  if (e.status === 'cancelled' || e.transparency === 'transparent') continue;\n  if (e.start?.dateTime && e.end?.dateTime) busy.push({ s: Date.parse(e.start.dateTime), e: Date.parse(e.end.dateTime) });\n  else if (e.start?.date && e.end?.date) busy.push({ s: DateTime.fromISO(e.start.date, { zone: tz }).startOf('day').toMillis(), e: DateTime.fromISO(e.end.date, { zone: tz }).startOf('day').toMillis() });\n  else return fail(503, 'calendar_bad_event_shape');\n}\n\nconst [hh, mm] = search.sessionTime.split(':').map(Number);\nconst earliest = Date.now() + cfg.min_notice * 60000;\nconst overlaps = (s, e) => busy.some(b => s < b.e && e > b.s);\n\nconst windowStart = DateTime.fromISO(search.startDate, { zone: tz }).startOf('day');\nconst sessions = [];\nlet idx = 0;\n\nfor (let d = 0; d < search.windowDays && idx < svc.lengths.length; d++) {\n  const day = windowStart.plus({ days: d });\n  const dayKey = DAYS[day.weekday - 1];\n  if (search.daysFilter && !search.daysFilter.includes(dayKey)) continue;\n  const openings = cfg.hours[dayKey] ?? [];\n  if (openings.length === 0) continue;\n\n  const len = svc.lengths[idx];\n  const startAt = day.set({ hour: hh, minute: mm, second: 0, millisecond: 0 });\n  const endAt = startAt.plus({ minutes: len });\n  const startMin = startAt.hour * 60 + startAt.minute;\n  const endMin = endAt.hour * 60 + endAt.minute;\n\n  const fitsHours = openings.some(([a, z]) => startMin >= a && endMin <= z);\n  if (!fitsHours) continue;\n  if (startAt.toMillis() < earliest) continue;\n  if (overlaps(startAt.toMillis(), endAt.toMillis())) continue;\n\n  sessions.push({ index: idx, date: startAt.toFormat('yyyy-MM-dd'), startIso: startAt.toISO(), endIso: endAt.toISO(), lengthMin: len });\n  idx++;\n}\n\nreturn [{ json: { meta, req, cfg, svc, sessions, allFound: sessions.length === svc.lengths.length } }];"
+      },
+      "id": "63d7047c-fed8-4ec8-b529-b37c4216dab0",
+      "name": "Compute Package Sessions",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -11248,
+        -3712
+      ],
+      "notes": "One session per open day at the fixed session_time from the request. If that exact time never fits, that day is skipped entirely (no per-day time-hunting) — keep this in mind when picking session_time."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 1
+          },
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{ $json.allFound }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "c89fe69d-ed49-4337-ae56-8b0d71dba0e5",
+      "name": "Sessions Found?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        -11024,
+        -3712
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const { meta, req, sessions, svc } = $input.first().json;\nconst foundCount = sessions.length;\nconst msg = foundCount > 0\n  ? `I could only find ${foundCount} of the ${svc.lengths.length} sessions needed in that window. Would you like to try a different start date, time, or spread of days?`\n  : \"I couldn't find any available sessions in that window. Would you like to try a different start date or time?\";\nreturn [{ json: { meta, req, res: { action: req.action, http: 200, category: 'package_no_availability', msg } } }];"
+      },
+      "id": "58844890-3be8-438c-9d92-2055a1959eba",
+      "name": "Build Package Unavailable Response",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -11024,
+        -3552
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 1
+          },
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{ $('Validate Business').first().json.req.action }}",
+              "rightValue": "book_package_appointment",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "24eb2b91-ebef-46a9-b704-d38e761eb5d4",
+      "name": "Is Booking Action?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        -10800,
+        -3712
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const { meta, req, sessions, svc } = $input.first().json;\nconst list = sessions.map(s => `${s.date} ${s.startIso.slice(11,16)}`).join(', ');\nreturn [{ json: { meta, req, res: { action: 'check_package_availability', http: 200, category: 'ok', body: {\n  available: true,\n  sessions: sessions.map(s => ({ date: s.date, start: s.startIso.slice(11,16), end: s.endIso.slice(11,16) })),\n  price: svc.price,\n  message: `${sessions.length} sessions available: ${list}. Total price: £${svc.price}.`\n} } } }];"
+      },
+      "id": "7a9c327c-7579-4711-bb81-dab1873282a1",
+      "name": "Build Package Availability Response",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -10576,
+        -3792
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const { req, cfg, svc, sessions, meta } = $input.first().json;\nconst now = DateTime.now().setZone(cfg.tz).toISODate();\nconst packageTag = [cfg.business_id, req.customer_phone, svc.name.toLowerCase().trim(), req.start_date].join('|');\nreturn sessions.map(sess => ({ json: {\n  meta, req, cfg, svc, sess, package_tag: packageTag,\n  key_material: [cfg.business_id, req.customer_phone, svc.name.toLowerCase().trim(), req.start_date, sess.index, now].join('|')\n} }));"
+      },
+      "id": "1dfeef97-798f-4edd-8ba0-2a961ae50bff",
+      "name": "Prepare Package Sessions For Booking",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -10576,
+        -3632
+      ],
+      "notes": "Fans out into N items, one per session. Everything downstream to Insert Package Events runs once per item automatically."
+    },
+    {
+      "parameters": {
+        "type": "SHA256",
+        "value": "={{ $json.key_material }}",
+        "dataPropertyName": "booking_key"
+      },
+      "id": "1c231876-27f5-477c-8b06-69eedb0f06da",
+      "name": "Compute Package Booking Keys",
+      "type": "n8n-nodes-base.crypto",
+      "typeVersion": 1,
+      "position": [
+        -10352,
+        -3632
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const items = $input.all();\nreturn items.map(it => {\n  const { req, cfg, svc, sess, booking_key, package_tag, meta } = it.json;\n  const description = [\n    `Customer Name: ${req.customer_name}`,\n    `Customer Phone: ${req.customer_phone}`,\n    `Customer Email: ${req.customer_email ?? ''}`,\n    `Business ID: ${cfg.business_id}`,\n    `Service: ${svc.name}`,\n    `Package ID: ${package_tag}`,\n    `Session: ${sess.index + 1} of ${svc.lengths.length}`\n  ].join('\\n');\n  return { json: { meta, req, cfg, svc, sess, booking_key,\n    q: { url: `https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(cfg.calendar_id)}/events` },\n    event: {\n      id: booking_key,\n      summary: `${svc.name} (session ${sess.index + 1}/${svc.lengths.length}) - ${req.customer_name}`,\n      description,\n      start: { dateTime: sess.startIso, timeZone: cfg.tz },\n      end: { dateTime: sess.endIso, timeZone: cfg.tz }\n    }\n  } };\n});"
+      },
+      "id": "8a5b5d57-b15a-4f94-bd65-6fc91d762ec5",
+      "name": "Build Package Event Payload",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -10128,
+        -3632
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.q.url }}",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleApi",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.event) }}",
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true,
+              "responseFormat": "json"
+            }
+          },
+          "timeout": 8000
+        }
+      },
+      "id": "8deb6749-a5f6-4787-b6b3-6da461756899",
+      "name": "Insert Package Events",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -9904,
+        -3632
+      ],
+      "credentials": {
+        "googleApi": {
+          "id": "cevWjRhyLBhJsO2U",
+          "name": "Google Service Account account"
+        }
+      },
+      "onError": "continueErrorOutput",
+      "notes": "Runs once per session item. neverError=true so application-level failures (4xx/5xx from Google) land on the success output as a normal response and are handled in Interpret Package Insert; onError only catches true network failures, same trade-off as the single-booking Insert Event node."
+    },
+    {
+      "parameters": {
+        "jsCode": "const ctxItems = $('Build Package Event Payload').all();\nconst respItems = $input.all();\nconst meta = ctxItems[0]?.json.meta;\nconst req = ctxItems[0]?.json.req;\nconst svc = ctxItems[0]?.json.svc;\n\nconst results = respItems.map((r, i) => {\n  const ctx = ctxItems[i]?.json ?? {};\n  const code = Number(r.json.statusCode);\n  const body = r.json.body ?? {};\n  const ok = code === 200 && body.status === 'confirmed' && body.id === ctx.booking_key;\n  return { ok, sess: ctx.sess, booking_key: ctx.booking_key, appointment_id: body.id, deleteUrl: ctx.q ? `${ctx.q.url}/${ctx.booking_key}` : null };\n});\n\nconst allOk = results.every(r => r.ok);\n\nif (allOk) {\n  const sessions = results.map(r => ({ date: r.sess.date, start: r.sess.startIso.slice(11,16), end: r.sess.endIso.slice(11,16), appointment_id: r.appointment_id }));\n  return [{ json: {\n    meta, req,\n    res: { action: 'book_package_appointment', http: 200, category: 'ok', body: {\n      success: true, message: `Your ${svc.name} package is booked: ${sessions.length} sessions starting ${req.start_date}. Total price: £${svc.price}.`, price: svc.price, sessions\n    } },\n    needRollback: false, toDelete: []\n  } }];\n}\n\nconst toDelete = results.filter(r => r.ok).map(r => r.deleteUrl).filter(Boolean);\nreturn [{ json: {\n  meta, req,\n  res: { action: 'book_package_appointment', http: 503, category: 'partial_package_booking_failure', msg: \"I wasn't able to book the full package — some sessions couldn't be reserved. Let me have the business call you to sort out the schedule.\" },\n  needRollback: toDelete.length > 0, toDelete\n} }];"
+      },
+      "id": "8eeb1687-0686-4a37-9df7-914159edd1e3",
+      "name": "Interpret Package Insert",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -9680,
+        -3632
+      ],
+      "notes": "Run once for all items (default Code node mode) — aggregates every session's insert result by matching index against Build Package Event Payload's items."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 1
+          },
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{ $json.needRollback }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "20e5a4df-9cce-4bc9-827b-ebc849d77f42",
+      "name": "Rollback Needed?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        -9456,
+        -3632
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const { toDelete, meta, req, res } = $input.first().json;\nreturn toDelete.map(u => ({ json: { meta, req, res, deleteUrl: u } }));"
+      },
+      "id": "3c976e6d-92fc-45f3-b394-ade35e116ef5",
+      "name": "Expand Rollback Targets",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -9232,
+        -3712
+      ]
+    },
+    {
+      "parameters": {
+        "method": "DELETE",
+        "url": "={{ $json.deleteUrl }}",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleApi",
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true,
+              "responseFormat": "json"
+            }
+          },
+          "timeout": 8000
+        }
+      },
+      "id": "7ec9d992-d664-4a12-8251-8c0be42e0111",
+      "name": "Delete Package Events (Rollback)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -9008,
+        -3712
+      ],
+      "credentials": {
+        "googleApi": {
+          "id": "cevWjRhyLBhJsO2U",
+          "name": "Google Service Account account"
+        }
+      },
+      "onError": "continueErrorOutput",
+      "notes": "Best-effort cleanup of the sessions that DID succeed when a partial booking fails. Its own outcome doesn't change what the customer is told — either output flows to Finalize After Rollback."
+    },
+    {
+      "parameters": {
+        "jsCode": "const items = $input.all();\nconst first = items[0]?.json ?? {};\nreturn [{ json: { meta: first.meta, req: first.req, res: first.res } }];"
+      },
+      "id": "f95455da-b455-4231-9c50-46d1e1010500",
+      "name": "Finalize After Rollback",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -9008,
+        -3552
+      ]
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Webhook": {
+      "main": [
+        [
+          {
+            "node": "Validate Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate Request": {
+      "main": [
+        [
+          {
+            "node": "Request OK?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Request OK?": {
+      "main": [
+        [
+          {
+            "node": "Load Business",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Finalize Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load Business": {
+      "main": [
+        [
+          {
+            "node": "Validate Business",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Error Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate Business": {
+      "main": [
+        [
+          {
+            "node": "Business OK?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Business OK?": {
+      "main": [
+        [
+          {
+            "node": "Route Action",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Finalize Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route Action": {
+      "main": [
+        [
+          {
+            "node": "Read FAQs",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Read Services",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Read Services",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Prepare Cancel Query",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Current DateTime",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Read Services",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Read Services",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Finalize Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read FAQs": {
+      "main": [
+        [
+          {
+            "node": "Match FAQ",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Error Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Match FAQ": {
+      "main": [
+        [
+          {
+            "node": "Finalize Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read Services": {
+      "main": [
+        [
+          {
+            "node": "Package Action?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Error Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Package Action?": {
+      "main": [
+        [
+          {
+            "node": "Resolve Package Service",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Resolve Service",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Resolve Service": {
+      "main": [
+        [
+          {
+            "node": "Slot Prep OK?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Slot Prep OK?": {
+      "main": [
+        [
+          {
+            "node": "Compute Booking Key",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Finalize Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Compute Booking Key": {
+      "main": [
+        [
+          {
+            "node": "List Events (Slot)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "List Events (Slot)": {
+      "main": [
+        [
+          {
+            "node": "Evaluate Slot",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Error Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Evaluate Slot": {
+      "main": [
+        [
+          {
+            "node": "Ready To Insert?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ready To Insert?": {
+      "main": [
+        [
+          {
+            "node": "Insert Event",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Finalize Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Insert Event": {
+      "main": [
+        [
+          {
+            "node": "Interpret Insert",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Error Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Interpret Insert": {
+      "main": [
+        [
+          {
+            "node": "Need Existing Check?",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Booking Just Created?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Error Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Need Existing Check?": {
+      "main": [
+        [
+          {
+            "node": "Get Existing Event",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Finalize Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Existing Event": {
+      "main": [
+        [
+          {
+            "node": "Interpret Existing",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Error Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Interpret Existing": {
+      "main": [
+        [
+          {
+            "node": "Finalize Response",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Error Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Cancel Query": {
+      "main": [
+        [
+          {
+            "node": "Query OK?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Query OK?": {
+      "main": [
+        [
+          {
+            "node": "List Events (Cancel)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Finalize Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "List Events (Cancel)": {
+      "main": [
+        [
+          {
+            "node": "Match Cancellation",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Error Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Match Cancellation": {
+      "main": [
+        [
+          {
+            "node": "One Match?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Error Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "One Match?": {
+      "main": [
+        [
+          {
+            "node": "Delete Event",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Finalize Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Delete Event": {
+      "main": [
+        [
+          {
+            "node": "Interpret Delete",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Error Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Interpret Delete": {
+      "main": [
+        [
+          {
+            "node": "Finalize Response",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Error Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Current DateTime": {
+      "main": [
+        [
+          {
+            "node": "Finalize Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Error Response": {
+      "main": [
+        [
+          {
+            "node": "Finalize Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Finalize Response": {
+      "main": [
+        [
+          {
+            "node": "Respond to Webhook",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Respond to Webhook": {
+      "main": [
+        [
+          {
+            "node": "Should Persist Log?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Should Persist Log?": {
+      "main": [
+        [
+          {
+            "node": "Append Log Row",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Booking Just Created?": {
+      "main": [
+        [
+          {
+            "node": "Prepare Notification Data",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Notification Data": {
+      "main": [
+        [
+          {
+            "node": "Generate Emails (Ollama)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Generate Emails (Ollama)": {
+      "main": [
+        [
+          {
+            "node": "Parse AI Emails",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse AI Emails": {
+      "main": [
+        [
+          {
+            "node": "Email Customer",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Email Business Owner",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Resolve Package Service": {
+      "main": [
+        [
+          {
+            "node": "Package Slot Prep OK?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Package Slot Prep OK?": {
+      "main": [
+        [
+          {
+            "node": "List Events (Package)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Finalize Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "List Events (Package)": {
+      "main": [
+        [
+          {
+            "node": "Compute Package Sessions",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Error Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Compute Package Sessions": {
+      "main": [
+        [
+          {
+            "node": "Sessions Found?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sessions Found?": {
+      "main": [
+        [
+          {
+            "node": "Is Booking Action?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Package Unavailable Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Package Unavailable Response": {
+      "main": [
+        [
+          {
+            "node": "Finalize Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is Booking Action?": {
+      "main": [
+        [
+          {
+            "node": "Prepare Package Sessions For Booking",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Package Availability Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Package Availability Response": {
+      "main": [
+        [
+          {
+            "node": "Finalize Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Package Sessions For Booking": {
+      "main": [
+        [
+          {
+            "node": "Compute Package Booking Keys",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Compute Package Booking Keys": {
+      "main": [
+        [
+          {
+            "node": "Build Package Event Payload",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Package Event Payload": {
+      "main": [
+        [
+          {
+            "node": "Insert Package Events",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Insert Package Events": {
+      "main": [
+        [
+          {
+            "node": "Interpret Package Insert",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Error Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Interpret Package Insert": {
+      "main": [
+        [
+          {
+            "node": "Rollback Needed?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Rollback Needed?": {
+      "main": [
+        [
+          {
+            "node": "Expand Rollback Targets",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Finalize Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Expand Rollback Targets": {
+      "main": [
+        [
+          {
+            "node": "Delete Package Events (Rollback)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Delete Package Events (Rollback)": {
+      "main": [
+        [
+          {
+            "node": "Finalize After Rollback",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Finalize After Rollback",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Finalize After Rollback": {
+      "main": [
+        [
+          {
+            "node": "Finalize Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "availableInMCP": false
+  },
+  "versionId": "001ef57f-e5b8-423b-b6b4-47347121d2f2",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "5ea964900d596cf2b75efeedf85f5f8ae4e8d652c96d11d2c575dc2ac20ca33e"
+  },
+  "nodeGroups": [],
+  "id": "QfmgSD1oSWoSsCRA",
+  "tags": []
+}
